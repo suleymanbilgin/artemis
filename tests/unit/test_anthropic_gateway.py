@@ -22,12 +22,12 @@ import httpx
 from pydantic import SecretStr
 import pytest
 
-from artemis.config import llm as llm_config
 from artemis.config.settings import Settings
 from artemis.core.diagnostics.probes import credentials_probe
 from artemis.llm import router
 from artemis.llm.router import ModelEndpoint, ModelFactory
 from mcp_server.tools import diagnose
+from third_party.mobile_use.config import llm as llm_config
 
 TOKEN = "test-gateway-token-123456"
 API_KEY = "test-official-key-123456"

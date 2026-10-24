@@ -14,136 +14,47 @@
 
 """LLM provider, model hierarchy, fallback chaining, and configuration loaders."""
 
-import os
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any
 
-import google.auth
-from google.auth.exceptions import DefaultCredentialsError
-from pydantic import BaseModel, ValidationError
 
 from artemis.config.constants import (
     LLM_CONFIG_FILENAME,
     AgentNode,
-    LLMProvider,
-    LLMUtilsNode,
 )
 from artemis.config.paths import ROOT_DIR, get_config_path
-from artemis.config.settings import settings
-from artemis.utils.file import load_jsonc
-from artemis.utils.logger import get_logger
+from artemis.utils.cython_compat import CyFunctionDetector
+from third_party.mobile_use.config import llm as base_llm_config
+from third_party.mobile_use.config.llm import (
+    LLM,
+    AgentNodeWithFallback,
+    LLMConfigBase,
+    LLMConfigUtils,
+    LLMUtilsNodeWithFallback,
+    LLMWithFallback,
+    validate_vertex_ai_credentials,
+)
+from third_party.mobile_use.utils.file import load_jsonc
+from third_party.mobile_use.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-
-def validate_vertex_ai_credentials() -> None:
-    """Validate Google Application Default Credentials for VertexAI provider."""
-    try:
-        _, project = google.auth.default()
-        if not project:
-            raise Exception("VertexAI requires a Google Cloud project to be set.")
-    except DefaultCredentialsError as e:
-        raise Exception(
-            f"VertexAI requires valid Google Application Default Credentials (ADC): {e}"
-        )
-
-
-class _CyFunctionDetectorMeta(type):
-    def __instancecheck__(self, instance):
-        name = type(instance).__name__
-        return (
-            name
-            in (
-                "cyfunction",
-                "cython_function_or_method",
-                "builtin_function_or_method",
-            )
-            or "cyfunction" in name.lower()
-        )
-
-
-class CyFunctionDetector(metaclass=_CyFunctionDetectorMeta):
-    """Utility type detector for Cython and C-extension functions in Pydantic."""
-
-    pass
-
-
-class LLM(BaseModel):
-    """Base model representing an LLM model provider and runtime parameters."""
-
-    model_config = {"ignored_types": (CyFunctionDetector,)}
-    provider: LLMProvider
-    model: str
-    # Per-endpoint base URL (jsonc key: "api_base"). Closes the gap where a
-    # custom endpoint (corporate gateway, LiteLLM proxy, local server) could
-    # only be configured process-wide through the protocol-scoped environment
-    # variables (OPENAI_BASE_URL / ANTHROPIC_BASE_URL): with this field two
-    # nodes can talk to two different endpoints in the same run — e.g. the
-    # planner through a corporate gateway while a util node uses the official
-    # API. Resolution order in ModelFactory:
-    #   endpoint.api_base  >  settings/env base URL  >  provider default.
-    # The value is provider-shaped, not host-shaped: the OpenAI driver expects
-    # the /v1 prefix in the URL while the Anthropic driver appends /v1/messages
-    # itself, so the same gateway host is spelled differently per provider —
-    # which is also why api_base must never survive a provider switch (see
-    # _drop_foreign_api_base below). Credentials deliberately stay OUT of this
-    # schema: keys and Bearer tokens belong in .env (ANTHROPIC_AUTH_TOKEN,
-    # OPENAI_API_KEY, ...), keeping model configs shareable and secret-free.
-    api_base: str | None = None
-    temperature: float | None = None
-    thinking_budget: int | None = None
-    thinking_level: Literal["minimal", "low", "medium", "high"] | None = None
-    reasoning_effort: Literal["none", "low", "medium", "high"] | None = None
-    include_thoughts: bool | None = None
-    enable_grounding: bool | None = None
-
-    def validate_provider(self, name: str) -> None:
-        """Ensure the required API key or credentials exist in settings for this provider."""
-        if self.provider == "openai":
-            if not settings.OPENAI_API_KEY:
-                raise Exception(f"{name} requires OPENAI_API_KEY in .env")
-        elif self.provider == "google":
-            if not settings.GOOGLE_API_KEY:
-                raise Exception(f"{name} requires GOOGLE_API_KEY in .env")
-        elif self.provider == "vertexai":
-            validate_vertex_ai_credentials()
-        elif self.provider == "anthropic":
-            # "anthropic" selects the wire protocol, not necessarily
-            # api.anthropic.com: Bearer-only gateways authenticate with
-            # ANTHROPIC_AUTH_TOKEN and never hold a real x-api-key, so
-            # requiring ANTHROPIC_API_KEY alone would reject valid gateway
-            # setups at startup and force users to mirror the token into
-            # ANTHROPIC_API_KEY as a workaround. Either credential satisfies
-            # this check; ModelFactory decides which one is actually sent.
-            if not (
-                settings.ANTHROPIC_API_KEY
-                or settings.get_anthropic_auth_token()
-                or os.environ.get("ANTHROPIC_API_KEY")
-            ):
-                raise Exception(
-                    f"{name} requires ANTHROPIC_API_KEY (or ANTHROPIC_AUTH_TOKEN"
-                    " for Bearer-only gateways) in .env"
-                )
-        elif self.provider == "openrouter":
-            if not settings.OPEN_ROUTER_API_KEY:
-                raise Exception(f"{name} requires OPEN_ROUTER_API_KEY in .env")
-        elif self.provider == "xai":
-            if not settings.XAI_API_KEY:
-                raise Exception(f"{name} requires XAI_API_KEY in .env")
-
-    def __str__(self) -> str:
-        return f"{self.provider}/{self.model}"
-
-
-class LLMWithFallback(LLM):
-    """LLM configuration with automatic secondary fallback and timeout specs."""
-
-    fallback: LLM
-    fix_model: str | None = None
-    timeout: float | None = None
-
-    def __str__(self) -> str:
-        return f"{self.provider}/{self.model} (fallback: {self.fallback})"
+__all__ = [
+    "LLM",
+    "AgentNodeWithFallback",
+    "LLMUtilsNodeWithFallback",
+    "CyFunctionDetector",
+    "LLMConfig",
+    "LLMConfigUtils",
+    "LLMWithFallback",
+    "deep_merge_llm_config",
+    "get_default_llm_config",
+    "initialize_llm_config",
+    "lightweight_judge_default",
+    "load_llm_config_override",
+    "parse_llm_config",
+    "validate_vertex_ai_credentials",
+]
 
 
 def lightweight_judge_default() -> "LLMWithFallback":
@@ -161,22 +72,9 @@ def lightweight_judge_default() -> "LLMWithFallback":
     )
 
 
-class LLMConfigUtils(BaseModel):
-    """Configuration container for auxiliary utility agents/nodes."""
-
-    model_config = {"ignored_types": (CyFunctionDetector,)}
-    outputter: LLMWithFallback
-    hopper: LLMWithFallback
-    video_analyzer: LLMWithFallback | None = None
-    object_detector: LLMWithFallback | None = None
-
-
-class LLMConfig(BaseModel):
+class LLMConfig(LLMConfigBase):
     """Comprehensive LLM configuration mapping every node to primary/fallback models."""
 
-    model_config = {"ignored_types": (CyFunctionDetector,)}
-    planner: LLMWithFallback
-    utils: LLMConfigUtils
     summarizer: LLMWithFallback
     operator: LLMWithFallback
     operator_summarizer: LLMWithFallback
@@ -195,13 +93,7 @@ class LLMConfig(BaseModel):
 
     def validate_providers(self) -> None:
         """Validate credentials across all configured agent nodes."""
-        self.planner.validate_provider("Planner")
-        self.utils.outputter.validate_provider("Outputter")
-        self.utils.hopper.validate_provider("Hopper")
-        if self.utils.video_analyzer:
-            self.utils.video_analyzer.validate_provider("VideoAnalyzer")
-        if self.utils.object_detector:
-            self.utils.object_detector.validate_provider("ObjectDetector")
+        super().validate_providers()
         self.summarizer.validate_provider("Summarizer")
         self.operator.validate_provider("Operator")
         self.operator_summarizer.validate_provider("OperatorSummarizer")
@@ -222,16 +114,6 @@ class LLMConfig(BaseModel):
         if self.output_analyzer:
             self.output_analyzer.validate_provider("OutputAnalyzer")
 
-    def __str__(self) -> str:
-        return f"""
-📃 Planner: {self.planner}
-🧩 Utils:
-    🔽 Hopper: {self.utils.hopper}
-    📝 Outputter: {self.utils.outputter}
-    🎬 Video Analyzer: {self.utils.video_analyzer or "Not configured"}
-    👁️ Object Detector: {self.utils.object_detector or "Not configured"}
-"""
-
     def get_agent(self, item: AgentNode) -> LLMWithFallback:
         """Retrieve model configuration for a specific agent node with sensible defaults."""
         val = getattr(self, item)
@@ -246,16 +128,6 @@ class LLMConfig(BaseModel):
             elif item == "output_analyzer":
                 return self.log_analyzer
         return val
-
-    def get_utils(self, item: LLMUtilsNode) -> LLMWithFallback:
-        """Retrieve model configuration for a specific utility node."""
-        value = getattr(self.utils, item)
-        if value is None:
-            raise ValueError(
-                f"Utils '{item}' is not configured. Please add it to your LLM "
-                "config or enable it via AgentConfigBuilder."
-            )
-        return value
 
 
 def _drop_foreign_api_base(cfg: dict, base: dict, override: dict) -> None:
@@ -371,10 +243,7 @@ def parse_llm_config() -> LLMConfig:
 
 def initialize_llm_config() -> LLMConfig:
     """Parse and validate credentials for LLMConfig."""
-    llm_config = parse_llm_config()
-    llm_config.validate_providers()
-    logger.success("LLM config initialized")
-    return llm_config
+    return base_llm_config.initialize_llm_config(parse_llm_config)
 
 
 def get_default_llm_config() -> LLMConfig:
@@ -401,26 +270,12 @@ def deep_merge_llm_config(base: LLMConfig, overrides: dict) -> LLMConfig:
 
 def load_llm_config_override(path: Path | str) -> LLMConfig:
     """Load custom LLM configuration JSON/JSONC overrides on top of default configuration."""
-    default_config = get_default_llm_config()
-
     resolved_path = Path(path)
     if not resolved_path.exists():
         try:
             resolved_path = get_config_path(str(path))
         except OSError:
             pass
-
-    override_config_dict = {}
-    if resolved_path.exists():
-        logger.info(f"Loading custom LLM config from {resolved_path.resolve()}...")
-        with open(resolved_path, encoding="utf-8") as f:
-            override_config_dict = load_jsonc(f)
-    else:
-        logger.warning(f"Custom LLM config not found at {path} - using default config")
-
-    try:
-        return deep_merge_llm_config(default_config, override_config_dict)
-    except ValidationError as e:
-        logger.error(f"Invalid LLM config: {e}")
-        logger.info("Falling back to default config")
-        return default_config
+    return base_llm_config.load_llm_config_override(
+        resolved_path, get_default_llm_config, deep_merge_llm_config
+    )
